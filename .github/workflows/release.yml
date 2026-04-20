@@ -1,4 +1,4 @@
-name: Generate Tag Release
+name: ${{ github.ref_name }}
 
 on:
   push:

@@ -134,16 +134,25 @@ def main():
     if not prs and not commits_content.strip():
         print("::warning::没有发现任何 PR 或 Commit，生成默认说明。")
         notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
-    else:
-        # 2. 构建 Prompt 并调用 AI
-    prompt = build_prompt(args.tag, prs, commits_content)
-    try:
-        notes_content = call_deepseek(prompt)
-        combined_notes = notes_content
-    except Exception as e:
-        print(f"::error::AI 调用最终失败，使用备用方案生成。错误: {e}")
-        notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
         combined_notes = f"""## 发布说明
+
+{notes_zh}
+
+---
+
+## Release Notes
+
+{notes_en}
+"""
+    else:
+        prompt = build_prompt(args.tag, prs, commits_content)
+        try:
+            notes_content = call_deepseek(prompt)
+            combined_notes = notes_content
+        except Exception as e:
+            print(f"::error::AI 调用最终失败，使用备用方案生成。错误: {e}")
+            notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
+            combined_notes = f"""## 发布说明
 
 {notes_zh}
 
@@ -158,7 +167,6 @@ def main():
     print(combined_notes)
     print("::endgroup::")
 
-    # 4. 写入文件供 Actions 截取
     with open("/tmp/release_notes.md", "w", encoding="utf-8") as f:
         f.write(combined_notes)
 
