@@ -131,7 +131,7 @@ jobs:
 
           if [ -f "About/About.xml" ]; then
             MOD_NAME=$(grep -oP '(?<=<name>)[^<]+' About/About.xml | head -1)
-            MOD_SAFE=$(echo "$MOD_NAME" | sed 's/[[:space:]]/_/g; s/[^a-zA-Z0-9._-]//g' | sed 's/__*/_/g; s/^_//; s/_$//')
+            MOD_SAFE=$(echo "$MOD_NAME" | sed 's/[^a-zA-Z0-9 ]//g' | sed 's/ /-/g' | sed 's/-\+/-/g')
           else
             MOD_SAFE="${{ github.event.repository.name }}"
           fi
