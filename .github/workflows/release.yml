@@ -128,10 +128,9 @@ jobs:
         run: |
           TAG="${{ steps.git-range.outputs.current }}"
 
-          # 从 About/About.xml 提取 mod 名称，找不到则用仓库名
           if [ -f "About/About.xml" ]; then
             MOD_NAME=$(grep -oP '(?<=<name>)[^<]+' About/About.xml | head -1)
-            MOD_SAFE=$(echo "$MOD_NAME" | sed 's/[[:space:]]/-/g; s/[^a-zA-Z0-9._-]//g')
+            MOD_SAFE=$(echo "$MOD_NAME" | sed 's/[[:space:]]/_/g; s/[^a-zA-Z0-9._-]//g' | sed 's/__*/_/g; s/^_//; s/_$//')
           else
             MOD_SAFE="${{ github.event.repository.name }}"
           fi

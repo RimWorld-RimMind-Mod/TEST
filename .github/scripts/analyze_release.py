@@ -9,7 +9,7 @@ import json
 import os
 import sys
 import time
-from openai import OpenAI, APIError, AuthenticationError
+from openai import OpenAI, APIError, APIStatusError, AuthenticationError
 
 def build_prompt(tag_name: str, prs: list, commits: str) -> str:
     """构建发送给 AI 的 prompt"""
@@ -39,26 +39,39 @@ PR #{pr.get('number', 'N/A')}:
 {prs_section}
 
 ## 输出要求
-1. 请分别生成中文和英文的发布说明。
-2. 按照常见分类（如：🌟 新特性 / 🐛 Bug 修复 / 🛠️ 优化 / 📝 文档）进行组织。
+1. 请分别生成中文和英文的发布说明，中文在前，英文在后。
+2. 按照常见分类（如：新特性、Feature、Bug 修复、Fix、优化、Improvement、文档、Documentation）进行组织。
 3. 语气专业、简明扼要。如果 PR 包含标签，请结合标签推断改动性质。
-4. 你必须输出一个严格的 JSON 对象，**不要包含任何 Markdown 代码块标记（如 ```json），不要包含任何解释性文字**。
+4. 直接输出 Markdown 格式的发布说明，不要使用任何代码块标记（如 ```json 或 ```markdown），不要包含任何解释性文字。
 
-格式如下：
-{{
-  "release_notes_zh": "### 🌟 新特性\\n- 实现了情绪记忆系统...\\n### 🐛 修复\\n- 修复了导致崩溃的寻路问题...",
-  "release_notes_en": "### 🌟 Features\\n- Implemented emotion memory system...\\n### 🐛 Fixes\\n- Fixed a crash related to pathfinding..."
-}}
+格式参考：
+## 发布说明
+
+### 🌟 新特性
+- 实现了情绪记忆系统
+
+### 🐛 Bug 修复
+- 修复了导致崩溃的寻路问题
+
+---
+
+## Release Notes
+
+### 🌟 Features
+- Implemented emotion memory system
+
+### 🐛 Fixes
+- Fixed a crash related to pathfinding
 """
     return prompt.strip()
 
-def call_deepseek(prompt: str) -> dict:
+def call_deepseek(prompt: str) -> tuple:
     """调用 DeepSeek API，带重试机制"""
     api_key = os.environ.get("DEEPSEEK_API_KEY")
     if not api_key:
         raise AuthenticationError("DEEPSEEK_API_KEY 环境变量未设置")
 
-    base_url = os.environ.get("DEEPSEEK_BASE_URL", "[https://api.deepseek.com](https://api.deepseek.com)")
+    base_url = os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
     model = os.environ.get("DEEPSEEK_MODEL", "deepseek-chat")
     client = OpenAI(api_key=api_key, base_url=base_url, timeout=60)
 
@@ -69,18 +82,17 @@ def call_deepseek(prompt: str) -> dict:
             response = client.chat.completions.create(
                 model=model,
                 messages=[
-                    {"role": "system", "content": "你是资深的开源项目维护者，负责编写清晰易读的 Release Notes。请严格遵守 JSON 返回格式。"},
+                    {"role": "system", "content": "你是资深的开源项目维护者，负责编写清晰易读的 Release Notes。请直接输出 Markdown 格式的发布说明，不要包含任何代码块标记。"},
                     {"role": "user", "content": prompt}
                 ],
-                response_format={"type": "json_object"},
                 temperature=0.3,
                 max_tokens=4096,
             )
-            return json.loads(response.choices[0].message.content)
+            return response.choices[0].message.content.strip()
         except AuthenticationError as e:
             print(f"::error::API 认证失败: {e}")
             raise
-        except APIError as e:
+        except (APIError, APIStatusError) as e:
             print(f"::warning::API 错误: {e}")
             if attempt < max_retries - 1:
                 time.sleep(2 ** attempt)
@@ -124,25 +136,22 @@ def main():
         notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
     else:
         # 2. 构建 Prompt 并调用 AI
-        prompt = build_prompt(args.tag, prs, commits_content)
-        try:
-            result = call_deepseek(prompt)
-            notes_zh = result.get("release_notes_zh", "AI 未返回中文说明")
-            notes_en = result.get("release_notes_en", "AI 未返回英文说明")
-        except Exception as e:
-            print(f"::error::AI 调用最终失败，使用备用方案生成。错误: {e}")
-            notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
+    prompt = build_prompt(args.tag, prs, commits_content)
+    try:
+        notes_content = call_deepseek(prompt)
+        combined_notes = notes_content
+    except Exception as e:
+        print(f"::error::AI 调用最终失败，使用备用方案生成。错误: {e}")
+        notes_zh, notes_en = generate_fallback_notes(prs, commits_content)
+        combined_notes = f"""## 发布说明
 
-    # 3. 组装最终 Markdown
-    combined_notes = f"""## Release Notes
-
-{notes_en}
+{notes_zh}
 
 ---
 
-## 发布说明
+## Release Notes
 
-{notes_zh}
+{notes_en}
 """
 
     print("::group::[Debug] 生成的最终 Release Note 预览")
