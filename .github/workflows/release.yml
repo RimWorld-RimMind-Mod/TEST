@@ -231,16 +231,14 @@ jobs:
         run: |
           python .github/scripts/analyze_release.py \
             --mod-name "${{ needs.prepare.outputs.mod_name }}" \
-            --tag "${{ needs.prepare.outputs.tag }}" \
-            --commits-file /tmp/commits.txt \
-            --prs-file /tmp/prs.json \
-            --output-file /tmp/notes.md
+            --current-version "${{ needs.prepare.outputs.tag }}" \
+            --prs-file /tmp/prs.json
 
       - name: Upload Notes Artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-notes
-          path: /tmp/notes.md
+          path: /tmp/release_notes.md
           retention-days: 1
 
   release:
@@ -307,7 +305,7 @@ jobs:
 
       - name: Prepare Final Notes
         run: |
-          cp /tmp/notes.md /tmp/final_notes.md
+          cp /tmp/release_notes.md /tmp/final_notes.md
           if [ -n "${{ github.event.inputs.notes_extra }}" ]; then
             echo "" >> /tmp/final_notes.md
             echo "---" >> /tmp/final_notes.md
