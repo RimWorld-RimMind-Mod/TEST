@@ -5,7 +5,6 @@ on:
     tags:
       - 'v[0-9]+.[0-9]+.[0-9]+*'
       - 'V[0-9]+.[0-9]+.[0-9]+*'
-
   workflow_dispatch:
     inputs:
       version:
@@ -39,30 +38,28 @@ jobs:
       mod_name: ${{ steps.info.outputs.mod_name }}
       mod_name_safe: ${{ steps.info.outputs.mod_name_safe }}
       is_prerelease: ${{ steps.info.outputs.is_prerelease }}
+      base_ref: ${{ steps.git-range.outputs.base }} # 输出上一个 Tag
+      head_ref: ${{ steps.git-range.outputs.head }} # 输出当前 Tag
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          fetch-depth: 0
+          fetch-depth: 0 # 必须拉取全部历史
 
       - name: Determine Version Info
         id: info
         run: |
+          # ... (保持你原来的逻辑不变) ...
           if [ "${{ github.event_name }}" == "push" ]; then
             TAG="${{ github.ref_name }}"
-            if echo "$TAG" | grep -qiE 'alpha|beta|rc|preview'; then
-              PRE="true"
-            else
-              PRE="false"
-            fi
+            if echo "$TAG" | grep -qiE 'alpha|beta|rc|preview'; then PRE="true"; else PRE="false"; fi
           else
             TAG="v${{ github.event.inputs.version }}"
             PRE="${{ github.event.inputs.prerelease }}"
           fi
-
           echo "tag=$TAG" >> $GITHUB_OUTPUT
           echo "is_prerelease=$PRE" >> $GITHUB_OUTPUT
-
+          # ... (Mod Name 逻辑保持不变) ...
           if [ -f "About/About.xml" ]; then
             MOD_NAME=$(grep -oP '(?<=<name>)[^<]+' About/About.xml | head -1)
             SAFE_NAME=$(echo "$MOD_NAME" | sed 's/[[:space:]]/-/g; s/[^a-zA-Z0-9._-]//g')
@@ -73,123 +70,105 @@ jobs:
           echo "mod_name=$MOD_NAME" >> $GITHUB_OUTPUT
           echo "mod_name_safe=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Collect Commits Since Last Tag
+      # [新增] 关键步骤：精准确定 Git 对比范围
+      - name: Determine Git Diff Range
+        id: git-range
         run: |
-          TAG="${{ steps.info.outputs.tag }}"
-          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
+          CURRENT_TAG="${{ steps.info.outputs.tag }}"
+          
+          # 尝试找到上一个 Tag
+          # git describe 会找到当前 commit 之前最近的一个 tag
+          PREVIOUS_TAG=$(git describe --tags --abbrev=0 "${CURRENT_TAG}^" 2>/dev/null || echo "")
 
-          if [ -z "$PREV" ]; then
-            echo "未找到上一个 tag，收集全部提交历史"
-            git log --pretty=format:"%s" > /tmp/commits.txt
+          if [ -z "$PREVIOUS_TAG" ]; then
+            echo "base=" >> $GITHUB_OUTPUT
+            echo "head=$CURRENT_TAG" >> $GITHUB_OUTPUT
+            echo "::notice:: 未找到上一个 Tag，将对比全部历史"
           else
-            echo "收集范围: $PREV .. $TAG"
-            git log "$PREV..$TAG" --pretty=format:"%s" > /tmp/commits.txt
+            echo "base=$PREVIOUS_TAG" >> $GITHUB_OUTPUT
+            echo "head=$CURRENT_TAG" >> $GITHUB_OUTPUT
+            echo "::notice:: 确定对比范围: ${PREVIOUS_TAG}...${CURRENT_TAG}"
           fi
 
-          echo "共 $(wc -l < /tmp/commits.txt) 条 commits"
+      # [增强] 收集 Commits 并打印详情
+      - name: Collect Commits
+        run: |
+          BASE="${{ steps.git-range.outputs.base }}"
+          HEAD="${{ steps.git-range.outputs.head }}"
+          
+          if [ -z "$BASE" ]; then
+            echo "### 收集全部 Commits (首次发布) ###"
+            git log --pretty=format:"* %h - %s" $HEAD > /tmp/commits.txt
+          else
+            echo "### 收集范围: $BASE 到 $HEAD ###"
+            git log --pretty=format:"* %h - %s" ${BASE}..${HEAD} > /tmp/commits.txt
+          fi
+          
+          # 【Debug 输出】直接把 Commit 列表打印到 Action 日志
+          echo "=================== Commits 列表 ==================="
+          cat /tmp/commits.txt
+          echo "===================================================="
 
+      # [重写] 精准收集 PR：不再看时间，只看 Git 记录
       - name: Collect PRs
         uses: actions/github-script@v7
         with:
           script: |
-            const tag = '${{ steps.info.outputs.tag }}';
-
-            // 获取当前 tag 的信息
-            const { data: tagData } = await github.rest.git.getRef({
+            const { data: compare } = await github.rest.repos.compareCommits({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              ref: `tags/${tag}`
+              base: '${{ steps.git-range.outputs.base }}' || context.sha, // 如果没 base，用这个糊弄一下，主要逻辑在下面判断
+              head: '${{ steps.git-range.outputs.head }}'
             });
-            const commitSha = tagData.object.sha;
-            const { data: commitData } = await github.rest.git.getCommit({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              commit_sha: commitSha
-            });
-            const tagDate = new Date(commitData.committer.date);
 
-            // 获取上一个 tag 的信息
-            let prevTagDate = null;
-            try {
-              const { data: tags } = await github.rest.git.listMatchingRefs({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                ref: 'tags/'
-              });
+            console.log(`::group::[Debug] GitHub API Compare 原始数据`);
+            console.log(`共 ${compare.commits.length} 个 commits 在范围内`);
+            
+            const prNumbers = new Set();
+            const prDetails = [];
 
-              // 筛选版本 tag 并排序
-              const versionTags = tags
-                .filter(t => t.ref.match(/refs\/tags\/v?\d+\.\d+\.\d+/i))
-                .sort((a, b) => new Date(b.object?.date || b.tagger?.date) - new Date(a.object?.date || a.tagger?.date));
-
-              // 找到当前 tag 的上一个版本 tag
-              const currentIndex = versionTags.findIndex(t => t.ref === `refs/tags/${tag}`);
-              if (currentIndex >= 0 && currentIndex < versionTags.length - 1) {
-                const prevTag = versionTags[currentIndex + 1];
-                const { data: prevCommitData } = await github.rest.git.getCommit({
-                  owner: context.repo.owner,
-                  repo: context.repo.repo,
-                  commit_sha: prevTag.object.sha
-                });
-                prevTagDate = new Date(prevCommitData.committer.date);
-                console.log(`上一个 tag: ${prevTag.ref.replace('refs/tags/', '')}, 日期: ${prevTagDate.toISOString()}`);
+            // 1. 遍历这个范围内的所有 Commit
+            for (const commit of compare.commits) {
+              // 检查 Commit 信息中是否关联了 PR (GitHub 会在 merge commit 信息里自动加 PR 号)
+              // 也可以检查 commit.message 里的 #123
+              const message = commit.commit.message;
+              const match = message.match(/\(\#(\d+)\)$/); // 匹配 "fix bug (#123)" 这种标准格式
+              
+              if (match) {
+                prNumbers.add(parseInt(match[1]));
               }
-            } catch (e) {
-              console.log('无法获取上一个 tag 信息:', e.message);
             }
 
-            // 获取所有已关闭的 PR
-            const { data: pulls } = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              state: 'closed',
-              sort: 'updated',
-              direction: 'desc',
-              per_page: 100
-            });
+            console.log(`从 Commit 信息中提取到 PR 号: ${[...prNumbers]}`);
+            console.log(`::endgroup::`);
 
-            const mergedPRs = [];
-            for (const pr of pulls) {
-              if (!pr.merged_at) continue;
-
-              const mergedAt = new Date(pr.merged_at);
-
-              // 只收集在当前 tag 之前的 PR
-              if (mergedAt > tagDate) continue;
-
-              // 如果有上一个 tag，只收集在上个 tag 之后的 PR
-              if (prevTagDate && mergedAt <= prevTagDate) continue;
-
-              const { data: files } = await github.rest.pulls.listFiles({
+            // 2. 获取这些 PR 的详细详情
+            for (const num of prNumbers) {
+              const { data: pr } = await github.rest.pulls.get({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
-                pull_number: pr.number
+                pull_number: num
               });
+              
+              console.log(`::group::[Debug] 获取 PR #${num} 详情`);
+              console.log(`标题: ${pr.title}`);
+              console.log(`Body: ${pr.body}`);
+              console.log(`::endgroup::`);
 
-              mergedPRs.push({
+              prDetails.push({
                 number: pr.number,
                 title: pr.title,
                 body: pr.body,
                 author: pr.user.login,
-                merged_at: pr.merged_at,
-                labels: pr.labels.map(l => l.name),
-                files: files.map(f => ({
-                  path: f.filename,
-                  changeType: f.status
-                }))
+                labels: pr.labels.map(l => l.name)
               });
             }
 
-            mergedPRs.sort((a, b) => new Date(a.merged_at) - new Date(b.merged_at));
-
-            if (prevTagDate) {
-              console.log(`收集到 ${mergedPRs.length} 个 PR（${prevTagDate.toISOString()} 至 ${tagDate.toISOString()}）`);
-            } else {
-              console.log(`收集到 ${mergedPRs.length} 个 PR（${tagDate.toISOString()} 之前，无历史 tag 限制）`);
-            }
-
+            // 3. 保存文件
             const fs = require('fs');
-            fs.writeFileSync('/tmp/prs.json', JSON.stringify(mergedPRs, null, 2));
+            fs.writeFileSync('/tmp/prs.json', JSON.stringify(prDetails, null, 2));
+            
+            console.log("::notice:: 最终收集到的 PR 数据已写入 prs.json");
 
       - name: Upload Data Artifact
         uses: actions/upload-artifact@v4
@@ -214,6 +193,15 @@ jobs:
           name: release-data
           path: /tmp
 
+      # [新增] 调试步骤：在运行脚本前，再次确认文件内容
+      - name: 🔍 Debug: Show Input Data
+        run: |
+          echo ">>>>>>>>>>>>>>>>>>>>>> Commits <<<<<<<<<<<<<<<<<<"
+          cat /tmp/commits.txt
+          echo ""
+          echo ">>>>>>>>>>>>>>>>>>>>>> PRs JSON <<<<<<<<<<<<<<<<<<"
+          cat /tmp/prs.json
+
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -227,19 +215,18 @@ jobs:
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL || 'https://api.deepseek.com' }}
-          DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL || 'deepseek-chat' }}
         run: |
           python .github/scripts/analyze_release.py \
             --mod-name "${{ needs.prepare.outputs.mod_name }}" \
             --current-version "${{ needs.prepare.outputs.tag }}" \
-            --prs-file /tmp/prs.json
+            --prs-file /tmp/prs.json \
+            --commits-txt /tmp/commits.txt
 
       - name: Upload Notes Artifact
         uses: actions/upload-artifact@v4
         with:
           name: release-notes
           path: /tmp/release_notes.md
-          retention-days: 1
 
   release:
     name: Create Release & Package

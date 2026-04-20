@@ -1,91 +1,3 @@
-#!/usr/bin/env python3
-"""
-RimMind Mod - AI 辅助 Release 分析脚本（汇总版）
-调用 DeepSeek API 汇总分析多个 PR，决定版本号升级类型并生成 Release Notes
-"""
-
-import argparse
-import json
-import os
-import re
-import sys
-import time
-
-try:
-    from openai import OpenAI, AuthenticationError, APIError
-except ImportError:
-    print("::error::缺少 openai 依赖，请安装: pip install openai")
-    sys.exit(1)
-
-
-def parse_version(v: str) -> tuple[int, int, int]:
-    """解析 SemVer 字符串，支持 v前缀"""
-    v = v.strip().lstrip("v")
-    m = re.match(r"^(\d+)\.(\d+)\.(\d+)", v)
-    if not m:
-        raise ValueError(f"无法解析版本号: {v}")
-    return int(m.group(1)), int(m.group(2)), int(m.group(3))
-
-
-def bump_version(current: str, bump: str) -> str:
-    """根据 bump 类型计算新版本号"""
-    major, minor, patch = parse_version(current)
-    if bump == "major":
-        return f"v{major + 1}.0.0"
-    elif bump == "minor":
-        return f"v{major}.{minor + 1}.0"
-    elif bump == "patch":
-        return f"v{major}.{minor}.{patch + 1}"
-    else:
-        return current
-
-
-def build_prompt(mod_name: str, prs: list[dict], current_version: str, manual_bump: str) -> str:
-    """构建发送给 AI 的 Prompt"""
-
-    pr_summaries = []
-    for i, pr in enumerate(prs, 1):
-        title = pr.get("title", "")
-        body = pr.get("body", "") or "(无描述)"
-        labels = pr.get("labels", [])
-        author = pr.get("author", "unknown")
-        files = pr.get("files", [])
-
-        file_list = []
-        for f in files:
-            path = f.get("path", "")
-            change_type = f.get("changeType", "modified")
-            file_list.append(f"    [{change_type}] {path}")
-
-        file_str = "\n".join(file_list) if file_list else "    (无变更文件信息)"
-
-        pr_summaries.append(f"""
-PR #{i}:
-  标题: {title}
-  作者: {author}
-  标签: {', '.join(labels) if labels else '(无)'}
-  描述: {body[:500]}{'...' if len(body) > 500 else ''}
-  变更文件:
-{file_str}
-""")
-
-    all_prs_str = "\n---\n".join(pr_summaries)
-    manual_hint = ""
-    if manual_bump != "auto":
-        manual_hint = f"\n【重要】维护者手动指定了版本号升级为: {manual_bump}。请尽量遵循此指定，但如果你发现指定不合理（如指定 patch 但实际有 breaking change），请在 reason 中说明并使用你认为正确的版本。"
-
-    prompt = f"""你是 RimWorld Mod 发布管理员，专门负责汇总分析多个 Pull Request 并决定版本号升级策略。
-
-## 当前信息
-
-- **Mod 名称**: {mod_name}
-- **当前版本**: {current_version}
-- **待汇总 PR 数量**: {len(prs)}
-{manual_hint}
-
-## 待汇总 PR 列表
-
-{all_prs_str}
 
 ## 版本号判断规则（严格执行）
 
@@ -194,7 +106,7 @@ def set_output(name: str, value: str):
         print(f"{name}={value}")
 
 
-def generate_fallback_notes(prs: list) -> tuple[str, str, str, str]:
+def generate_fallback_notes(prs: list, commits: str) -> tuple[str, str, str, str]:
     """当 API 失败时生成简单的发布说明"""
     lines_zh = []
     lines_en = []
@@ -224,29 +136,44 @@ def generate_fallback_notes(prs: list) -> tuple[str, str, str, str]:
     notes_zh = "### 变更\n" + "\n".join(lines_zh) if lines_zh else "### 变更\n- 常规更新"
     notes_en = "### Changes\n" + "\n".join(lines_en) if lines_en else "### Changes\n- Routine updates"
 
-    return bump, "API 认证失败，使用简单格式替代", notes_zh, notes_en
+    return bump, "API 调用失败，使用简单格式替代", notes_zh, notes_en
 
 
 def main():
     parser = argparse.ArgumentParser(description="汇总分析多个 PR 并决定 Release 版本号")
     parser.add_argument("--mod-name", required=True, help="Mod 名称")
     parser.add_argument("--prs-file", required=True, help="PR 数据 JSON 文件路径")
+    parser.add_argument("--commits-txt", required=True, help="Commit 历史 TXT 文件路径") # [新增] 参数
     parser.add_argument("--current-version", required=True, help="当前版本号")
     parser.add_argument("--manual-bump", default="auto", choices=["auto", "major", "minor", "patch", "none"],
                         help="手动指定的版本号升级策略")
     args = parser.parse_args()
 
+    # 1. 加载数据
     with open(args.prs_file, "r", encoding="utf-8") as f:
         prs = json.load(f)
+    
+    commits_content = ""
+    if os.path.exists(args.commits_txt):
+        with open(args.commits_txt, "r", encoding="utf-8") as f:
+            commits_content = f.read()
 
     current_version = args.current_version
     manual_bump = args.manual_bump
 
-    print(f"::group::汇总分析 {len(prs)} 个 PR")
-    for pr in prs:
-        print(f"  PR #{pr.get('number', '?')}: {pr.get('title', '')}")
+    # 2. 【增强】超级详细的 Debug 输出
+    print(f"::group::🔍 [Debug] 脚本输入数据核查")
     print(f"当前版本: {current_version}")
     print(f"手动指定: {manual_bump}")
+    print(f"Mod 名称: {args.mod_name}")
+    print("-" * 30)
+    print(f"PR 文件路径: {args.prs_file}")
+    print(f"PR 数量: {len(prs)}")
+    for pr in prs:
+        print(f"  -> PR #{pr.get('number', '?')}: {pr.get('title', '')} (Files: {len(pr.get('files', []))})")
+    print("-" * 30)
+    print(f"Commit 文件路径: {args.commits_txt}")
+    print(f"Commit 内容预览:\n{commits_content[:500]}...")
     print("::endgroup::")
 
     if not prs:
@@ -256,8 +183,8 @@ def main():
         set_output("reason", "没有发现合并的 PR")
         sys.exit(0)
 
-    # 构建 prompt 并调用 AI
-    prompt = build_prompt(args.mod_name, prs, current_version, manual_bump)
+    # 3. 构建 prompt 并调用 AI
+    prompt = build_prompt(args.mod_name, prs, commits_content, current_version, manual_bump)
 
     try:
         result = call_deepseek(prompt)
@@ -268,11 +195,11 @@ def main():
         confidence = result.get("confidence", 0.5)
     except AuthenticationError:
         print("::warning::API 认证失败，使用备用方案生成简单发布说明")
-        bump, reason, release_notes_zh, release_notes_en = generate_fallback_notes(prs)
+        bump, reason, release_notes_zh, release_notes_en = generate_fallback_notes(prs, commits_content)
         confidence = 0.5
     except Exception as e:
         print(f"::warning::API 调用失败: {e}，使用备用方案")
-        bump, reason, release_notes_zh, release_notes_en = generate_fallback_notes(prs)
+        bump, reason, release_notes_zh, release_notes_en = generate_fallback_notes(prs, commits_content)
         confidence = 0.5
 
     # 如果维护者手动指定了版本号，以手动指定为准
@@ -305,6 +232,8 @@ def main():
 ---
 
 *本次发布共汇总 {len(prs)} 个 PR，分析结果: bump={bump}, confidence={confidence}*
+
+**分析原因**: {reason}
 """
 
     print(f"::group::汇总分析结果")
