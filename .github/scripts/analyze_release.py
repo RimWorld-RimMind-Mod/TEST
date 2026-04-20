@@ -1,197 +1,118 @@
 #!/usr/bin/env python3
-"""
-AI Release Analyzer
-分析 PR 变更并决定版本号升级策略
-"""
+"""RimWorld Mod - AI Release Notes 生成脚本"""
 
 import argparse
 import json
 import os
-import re
 import sys
-from typing import Optional
 
 from openai import OpenAI
 
 
-def parse_version(version: str) -> tuple:
-    """解析版本号 v1.2.3 -> (1, 2, 3)"""
-    match = re.match(r'v?(\d+)\.(\d+)\.(\d+)', version)
-    if not match:
-        return (0, 0, 0)
-    return tuple(int(x) for x in match.groups())
+def build_prompt(mod_name: str, tag: str, commits: list, prs: list) -> str:
+    """构建 AI Prompt"""
+
+    def fmt_pr(pr: dict, idx: int) -> str:
+        files = "\n".join(f"    [{f.get('changeType', 'M')}] {f.get('path', '')}" for f in pr.get("files", []))
+        body = (pr.get("body", "") or "(无描述)")[:500]
+        return f"""PR #{idx}:
+  标题: {pr.get('title', '')}
+  作者: {pr.get('author', 'unknown')}
+  标签: {', '.join(pr.get('labels', [])) or '(无)'}
+  描述: {body}{'...' if len(pr.get('body', '')) > 500 else ''}
+  变更文件:\n{files or '    (无)'}"""
+
+    prs_str = "\n---\n".join(fmt_pr(pr, i) for i, pr in enumerate(prs, 1))
+    commits_str = "\n".join(f"  - {c}" for c in commits[:50])
+
+    return f"""你是 RimWorld Mod 发布管理员，根据变更内容生成 Release Notes。
+
+## 当前信息
+- **Mod 名称**: {mod_name}
+- **版本标签**: {tag}
+- **PR 数量**: {len(prs)}
+- **Commit 数量**: {len(commits)}
+
+## Commit 列表
+{commits_str}
+
+## PR 列表
+{prs_str if prs else '(无 PR)'}
+
+## 分类规则
+1. **Added/新增**: 新功能、新事件、新配置、新 AI 行为
+2. **Changed/变更**: 重新平衡、修改现有行为
+3. **Fixed/修复**: Bug 修复、性能优化
+4. **Removed/移除**: 删除功能或内容
+5. **Technical/技术**: CI/CD、重构、文档
+
+## 输出格式 (纯 JSON)
+{{"release_notes_en": "### Added\\n- ...\\n\\n### Fixed\\n- ...", "release_notes_zh": "### 新增\\n- ...\\n\\n### 修复\\n- ...", "summary": "一句话总结", "confidence": 0.9}}"""
 
 
-def bump_version(current: str, bump_type: str) -> str:
-    """根据升级类型计算新版本号"""
-    major, minor, patch = parse_version(current)
-
-    if bump_type == 'major':
-        return f"v{major + 1}.0.0"
-    elif bump_type == 'minor':
-        return f"v{major}.{minor + 1}.0"
-    elif bump_type == 'patch':
-        return f"v{major}.{minor}.{patch + 1}"
-    else:
-        return current
-
-
-def analyze_prs_with_ai(
-    client: OpenAI,
-    mod_name: str,
-    prs: list,
-    current_version: str,
-    manual_bump: Optional[str] = None
-) -> dict:
-    """使用 AI 分析 PR 并决定版本号"""
-
-    # 构建提示词
-    prs_text = json.dumps(prs, indent=2, ensure_ascii=False) if prs else "没有新的 PR"
-
-    prompt = f"""你是一个专业的软件版本管理助手。请分析以下 GitHub PR 列表，决定版本号升级策略。
-
-Mod 名称: {mod_name}
-当前版本: {current_version}
-手动指定升级类型: {manual_bump if manual_bump and manual_bump != 'auto' else '无（自动判断）'}
-
-PR 列表 (JSON 格式):
-{prs_text}
-
-请根据以下语义化版本规范分析：
-- MAJOR: 不兼容的 API 修改、重大功能变更、破坏性更新
-- MINOR: 向下兼容的功能新增、新特性添加
-- PATCH: 向下兼容的问题修复、bug 修复、小优化
-
-请严格按以下 JSON 格式输出，不要包含任何其他内容：
-{{
-  "bump": "patch|minor|major|none",
-  "new_version": "vX.Y.Z",
-  "reason": "简短说明原因（中文）",
-  "release_notes": "Markdown 格式的发布说明，包含：\\n## 变更概要\\n\\n### 新功能\\n- ...\\n\\n### 修复\\n- ...\\n\\n### 其他\\n- ..."
-}}
-
-要求：
-1. 如果没有实质性变更（只有文档更新、格式化等），返回 "bump": "none"
-2. release_notes 使用 Markdown 格式，按类别分组
-3. 每个 PR 的标题应该被概括到相应的类别中
-4. 只输出 JSON，不要有任何解释性文字
-"""
-
-    try:
-        response = client.chat.completions.create(
-            model=os.getenv('DEEPSEEK_MODEL', 'deepseek-chat'),
-            messages=[
-                {"role": "system", "content": "你是一个专业的软件版本管理助手，擅长语义化版本控制(SemVer)和生成发布说明。"},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=2000
-        )
-
-        content = response.choices[0].message.content.strip()
-
-        # 尝试解析 JSON
-        try:
-            result = json.loads(content)
-        except json.JSONDecodeError:
-            # 尝试从 markdown 代码块中提取
-            match = re.search(r'```(?:json)?\s*(\{.*?\})\s*```', content, re.DOTALL)
-            if match:
-                result = json.loads(match.group(1))
-            else:
-                raise
-
-        # 如果手动指定了 bump 类型，覆盖 AI 的决定
-        if manual_bump and manual_bump != 'auto':
-            result['bump'] = manual_bump
-            result['new_version'] = bump_version(current_version, manual_bump)
-            result['reason'] = f"手动指定为 {manual_bump} 升级"
-
-        return result
-
-    except Exception as e:
-        print(f"AI 分析失败: {e}", file=sys.stderr)
-        # 默认降级为 patch
-        return {
-            "bump": "patch" if prs else "none",
-            "new_version": bump_version(current_version, "patch"),
-            "reason": f"AI 分析失败，默认升级: {str(e)}",
-            "release_notes": "## 变更概要\n\n" + "\n".join([f"- #{pr['number']}: {pr['title']}" for pr in prs]) if prs else "无变更"
-        }
-
-
-def set_github_output(outputs: dict):
-    """设置 GitHub Actions 输出"""
-    github_output = os.getenv('GITHUB_OUTPUT')
-    if github_output:
-        with open(github_output, 'a') as f:
-            for key, value in outputs.items():
-                # 处理多行值
-                if '\n' in str(value):
-                    f.write(f"{key}<<EOF\n{value}\nEOF\n")
-                else:
-                    f.write(f"{key}={value}\n")
-
-    # 同时打印到日志
-    for key, value in outputs.items():
-        print(f"::set-output name={key}::{value}")
-        print(f"{key}={value}")
+def call_deepseek(prompt: str) -> dict:
+    """调用 DeepSeek API"""
+    client = OpenAI(
+        api_key=os.environ["DEEPSEEK_API_KEY"],
+        base_url=os.environ.get("DEEPSEEK_BASE_URL", "https://api.deepseek.com")
+    )
+    resp = client.chat.completions.create(
+        model=os.environ.get("DEEPSEEK_MODEL", "deepseek-chat"),
+        messages=[
+            {"role": "system", "content": "你是 RimWorld Mod 发布管理员，严格返回 JSON，无额外文字。"},
+            {"role": "user", "content": prompt}
+        ],
+        response_format={"type": "json_object"},
+        temperature=0.3,
+        max_tokens=4096,
+    )
+    return json.loads(resp.choices[0].message.content)
 
 
 def main():
-    parser = argparse.ArgumentParser(description='AI Release Analyzer')
-    parser.add_argument('--mod-name', required=True, help='Mod 名称')
-    parser.add_argument('--prs-file', required=True, help='PR 列表 JSON 文件路径')
-    parser.add_argument('--current-version', required=True, help='当前版本号')
-    parser.add_argument('--manual-bump', default='auto', help='手动指定升级类型')
-
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--mod-name", required=True)
+    parser.add_argument("--tag", required=True)
+    parser.add_argument("--commits-file", required=True)
+    parser.add_argument("--prs-file", required=True)
+    parser.add_argument("--output-file", required=True)
     args = parser.parse_args()
 
-    # 读取 PR 列表
-    try:
-        with open(args.prs_file, 'r') as f:
-            content = f.read()
-            # 处理可能的转义
-            content = content.replace('\\"', '"')
-            prs = json.loads(content) if content.strip() else []
-    except (json.JSONDecodeError, FileNotFoundError) as e:
-        print(f"读取 PR 文件失败: {e}", file=sys.stderr)
-        prs = []
+    with open(args.commits_file, "r", encoding="utf-8") as f:
+        commits = [line.strip() for line in f if line.strip()]
 
-    print(f"读取到 {len(prs)} 个 PR")
+    with open(args.prs_file, "r", encoding="utf-8") as f:
+        prs = json.load(f)
 
-    # 初始化 OpenAI 客户端
-    client = OpenAI(
-        api_key=os.getenv('DEEPSEEK_API_KEY'),
-        base_url=os.getenv('DEEPSEEK_BASE_URL', 'https://api.deepseek.com')
-    )
+    print(f"分析 {len(commits)} 条 commits, {len(prs)} 个 PR")
 
-    # 分析
-    result = analyze_prs_with_ai(
-        client=client,
-        mod_name=args.mod_name,
-        prs=prs,
-        current_version=args.current_version,
-        manual_bump=args.manual_bump
-    )
+    if not commits and not prs:
+        notes = f"## Release Notes\n\nNo significant changes.\n\n---\n\n## 发布说明\n\n无重大变更。"
+        with open(args.output_file, "w", encoding="utf-8") as f:
+            f.write(notes)
+        return
 
-    print(f"分析结果:")
-    print(f"  bump: {result['bump']}")
-    print(f"  new_version: {result['new_version']}")
-    print(f"  reason: {result['reason']}")
+    result = call_deepseek(build_prompt(args.mod_name, args.tag, commits, prs))
 
-    # 设置输出
-    set_github_output({
-        'bump': result['bump'],
-        'new_version': result['new_version'],
-        'reason': result['reason'],
-        'release_notes': result['release_notes']
-    })
+    notes = f"""## Release Notes
 
-    # 如果无需升级，返回非零退出码
-    if result['bump'] == 'none':
-        sys.exit(0)
+{result.get('release_notes_en', '')}
+
+---
+
+## 发布说明
+
+{result.get('release_notes_zh', '')}
+
+---
+
+*{len(commits)} commits, {len(prs)} PRs, confidence={result.get('confidence', 0.5)}*"""
+
+    print(f"生成完成: {result.get('summary', '')}")
+
+    with open(args.output_file, "w", encoding="utf-8") as f:
+        f.write(notes)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
