@@ -93,6 +93,8 @@ jobs:
         with:
           script: |
             const tag = '${{ steps.info.outputs.tag }}';
+
+            // 获取当前 tag 的信息
             const { data: tagData } = await github.rest.git.getRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -106,6 +108,37 @@ jobs:
             });
             const tagDate = new Date(commitData.committer.date);
 
+            // 获取上一个 tag 的信息
+            let prevTagDate = null;
+            try {
+              const { data: tags } = await github.rest.git.listMatchingRefs({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                ref: 'tags/'
+              });
+
+              // 筛选版本 tag 并排序
+              const versionTags = tags
+                .filter(t => t.ref.match(/refs\/tags\/v?\d+\.\d+\.\d+/i))
+                .sort((a, b) => new Date(b.object?.date || b.tagger?.date) - new Date(a.object?.date || a.tagger?.date));
+
+              // 找到当前 tag 的上一个版本 tag
+              const currentIndex = versionTags.findIndex(t => t.ref === `refs/tags/${tag}`);
+              if (currentIndex >= 0 && currentIndex < versionTags.length - 1) {
+                const prevTag = versionTags[currentIndex + 1];
+                const { data: prevCommitData } = await github.rest.git.getCommit({
+                  owner: context.repo.owner,
+                  repo: context.repo.repo,
+                  commit_sha: prevTag.object.sha
+                });
+                prevTagDate = new Date(prevCommitData.committer.date);
+                console.log(`上一个 tag: ${prevTag.ref.replace('refs/tags/', '')}, 日期: ${prevTagDate.toISOString()}`);
+              }
+            } catch (e) {
+              console.log('无法获取上一个 tag 信息:', e.message);
+            }
+
+            // 获取所有已关闭的 PR
             const { data: pulls } = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -118,7 +151,14 @@ jobs:
             const mergedPRs = [];
             for (const pr of pulls) {
               if (!pr.merged_at) continue;
-              if (new Date(pr.merged_at) > tagDate) continue;
+
+              const mergedAt = new Date(pr.merged_at);
+
+              // 只收集在当前 tag 之前的 PR
+              if (mergedAt > tagDate) continue;
+
+              // 如果有上一个 tag，只收集在上个 tag 之后的 PR
+              if (prevTagDate && mergedAt <= prevTagDate) continue;
 
               const { data: files } = await github.rest.pulls.listFiles({
                 owner: context.repo.owner,
@@ -141,7 +181,12 @@ jobs:
             }
 
             mergedPRs.sort((a, b) => new Date(a.merged_at) - new Date(b.merged_at));
-            console.log(`收集到 ${mergedPRs.length} 个已合并 PR（在 ${tagDate.toISOString()} 之前）`);
+
+            if (prevTagDate) {
+              console.log(`收集到 ${mergedPRs.length} 个 PR（${prevTagDate.toISOString()} 至 ${tagDate.toISOString()}）`);
+            } else {
+              console.log(`收集到 ${mergedPRs.length} 个 PR（${tagDate.toISOString()} 之前，无历史 tag 限制）`);
+            }
 
             const fs = require('fs');
             fs.writeFileSync('/tmp/prs.json', JSON.stringify(mergedPRs, null, 2));
