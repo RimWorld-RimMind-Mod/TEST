@@ -1,0 +1,25 @@
+[
+  {
+    "number": 1,
+    "title": "添加 AI 情绪感知系统",
+    "body": "实现了 RimWorld 角色的情绪感知模块，可以检测其他角色的情绪状态并作出反应。",
+    "author": "test-user",
+    "merged_at": "2025-04-15T10:00:00Z",
+    "labels": ["feature", "enhancement"],
+    "files": [
+      {"path": "Source/AI/EmotionSensor.cs", "changeType": "added"},
+      {"path": "Defs/ThinkTreeDefs/AI_Emotion.xml", "changeType": "modified"}
+    ]
+  },
+  {
+    "number": 2,
+    "title": "修复对话系统崩溃问题",
+    "body": "修复了当角色死亡时对话系统尝试访问空引用导致的崩溃。",
+    "author": "test-user",
+    "merged_at": "2025-04-18T14:30:00Z",
+    "labels": ["bugfix", "patch"],
+    "files": [
+      {"path": "Source/Dialog/DialogManager.cs", "changeType": "modified"}
+    ]
+  }
+]
