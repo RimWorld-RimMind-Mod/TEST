@@ -1,35 +1,24 @@
-# Release 自动创建工作流
-# 功能：
-# 1. 手动触发或 Agent 触发创建 Release
-# 2. 收集上次 Release 以来的所有 PR
-# 3. 调用 AI (DeepSeek) 分析变更并决定版本号
-# 4. 自动生成 Release Notes
-# 5. 创建 GitHub Release
-# 6. 触发 Steam 上传工作流
-
 name: Create Release
 
 on:
-  # 手动触发 - 仅支持通过 GitHub UI 或 API 调用
+  push:
+    tags:
+      - 'v[0-9]+.[0-9]+.[0-9]+*'
+      - 'V[0-9]+.[0-9]+.[0-9]+*'
+
   workflow_dispatch:
     inputs:
-      bump_type:
-        description: '版本号升级类型 (可选)'
-        required: false
-        default: 'auto'
-        type: choice
-        options:
-          - auto
-          - major
-          - minor
-          - patch
+      version:
+        description: '版本号 (如 1.2.3，不要加 v)'
+        required: true
+        type: string
       prerelease:
         description: '是否为预发布版本'
         required: false
         default: false
         type: boolean
-      notes:
-        description: '补充说明 (可选)'
+      notes_extra:
+        description: '补充说明 (追加到 Release Notes 末尾)'
         required: false
         type: string
 
@@ -42,86 +31,81 @@ env:
   PYTHON_VERSION: '3.11'
 
 jobs:
-  # 准备阶段：收集信息和检查
   prepare:
-    name: Prepare Release
+    name: Prepare Release Data
     runs-on: ubuntu-latest
     outputs:
-      should_release: ${{ steps.check.outputs.should_release }}
-      current_version: ${{ steps.version.outputs.current_version }}
-      mod_name: ${{ steps.mod_info.outputs.mod_name }}
-      prs_since_last_release: ${{ steps.collect_prs.outputs.prs }}
+      tag: ${{ steps.info.outputs.tag }}
+      mod_name: ${{ steps.info.outputs.mod_name }}
+      mod_name_safe: ${{ steps.info.outputs.mod_name_safe }}
+      is_prerelease: ${{ steps.info.outputs.is_prerelease }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Get Mod Info
-        id: mod_info
+      - name: Determine Version Info
+        id: info
         run: |
-          # 从 About.xml 读取 Mod 名称
+          if [ "${{ github.event_name }}" == "push" ]; then
+            TAG="${{ github.ref_name }}"
+            if echo "$TAG" | grep -qiE 'alpha|beta|rc|preview'; then
+              PRE="true"
+            else
+              PRE="false"
+            fi
+          else
+            TAG="v${{ github.event.inputs.version }}"
+            PRE="${{ github.event.inputs.prerelease }}"
+          fi
+
+          echo "tag=$TAG" >> $GITHUB_OUTPUT
+          echo "is_prerelease=$PRE" >> $GITHUB_OUTPUT
+
           if [ -f "About/About.xml" ]; then
             MOD_NAME=$(grep -oP '(?<=<name>)[^<]+' About/About.xml | head -1)
-            echo "mod_name=$MOD_NAME" >> $GITHUB_OUTPUT
+            SAFE_NAME=$(echo "$MOD_NAME" | sed 's/[[:space:]]/-/g; s/[^a-zA-Z0-9._-]//g')
           else
-            # 使用仓库名
-            echo "mod_name=${{ github.event.repository.name }}" >> $GITHUB_OUTPUT
+            MOD_NAME="${{ github.event.repository.name }}"
+            SAFE_NAME="$MOD_NAME"
           fi
+          echo "mod_name=$MOD_NAME" >> $GITHUB_OUTPUT
+          echo "mod_name_safe=$SAFE_NAME" >> $GITHUB_OUTPUT
 
-      - name: Get Current Version
-        id: version
+      - name: Collect Commits Since Last Tag
         run: |
-          # 获取最新的 release tag
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "v0.0.0")
-          echo "current_version=$LATEST_TAG" >> $GITHUB_OUTPUT
-          echo "当前版本: $LATEST_TAG"
+          TAG="${{ steps.info.outputs.tag }}"
+          PREV=$(git describe --tags --abbrev=0 "$TAG^" 2>/dev/null || echo "")
 
-      - name: Check Should Release
-        id: check
-        run: |
-          # 如果是手动触发，总是执行
-          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "手动触发，执行发布"
-            exit 0
-          fi
-
-          # 检查上次 release 以来是否有新的 commit
-          LATEST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-          if [ -z "$LATEST_TAG" ]; then
-            echo "should_release=true" >> $GITHUB_OUTPUT
-            echo "没有找到之前的 release，执行发布"
+          if [ -z "$PREV" ]; then
+            echo "未找到上一个 tag，收集全部提交历史"
+            git log --pretty=format:"%s" > /tmp/commits.txt
           else
-            COMMITS_SINCE=$(git log $LATEST_TAG..HEAD --oneline | wc -l)
-            if [ "$COMMITS_SINCE" -gt 0 ]; then
-              echo "should_release=true" >> $GITHUB_OUTPUT
-              echo "自上次 release 有 $COMMITS_SINCE 个新提交，执行发布"
-            else
-              echo "should_release=false" >> $GITHUB_OUTPUT
-              echo "没有新提交，跳过发布"
-            fi
+            echo "收集范围: $PREV .. $TAG"
+            git log "$PREV..$TAG" --pretty=format:"%s" > /tmp/commits.txt
           fi
 
-      - name: Collect PRs Since Last Release
-        id: collect_prs
-        if: steps.check.outputs.should_release == 'true'
+          echo "共 $(wc -l < /tmp/commits.txt) 条 commits"
+
+      - name: Collect PRs
         uses: actions/github-script@v7
         with:
           script: |
-            // 获取上次 release 的日期
-            const { data: releases } = await github.rest.repos.listReleases({
+            const tag = '${{ steps.info.outputs.tag }}';
+            const { data: tagData } = await github.rest.git.getRef({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              per_page: 1
+              ref: `tags/${tag}`
             });
+            const commitSha = tagData.object.sha;
+            const { data: commitData } = await github.rest.git.getCommit({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              commit_sha: commitSha
+            });
+            const tagDate = new Date(commitData.committer.date);
 
-            let since = null;
-            if (releases.length > 0 && releases[0].published_at) {
-              since = new Date(releases[0].published_at);
-            }
-
-            // 获取所有 merged 的 PR
             const { data: pulls } = await github.rest.pulls.list({
               owner: context.repo.owner,
               repo: context.repo.repo,
@@ -134,9 +118,8 @@ jobs:
             const mergedPRs = [];
             for (const pr of pulls) {
               if (!pr.merged_at) continue;
-              if (since && new Date(pr.merged_at) <= since) continue;
+              if (new Date(pr.merged_at) > tagDate) continue;
 
-              // 获取 PR 的文件变更
               const { data: files } = await github.rest.pulls.listFiles({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
@@ -157,32 +140,34 @@ jobs:
               });
             }
 
-            // 按合并时间排序
             mergedPRs.sort((a, b) => new Date(a.merged_at) - new Date(b.merged_at));
+            console.log(`收集到 ${mergedPRs.length} 个已合并 PR（在 ${tagDate.toISOString()} 之前）`);
 
-            console.log(`找到 ${mergedPRs.length} 个 PR 自上次 release`);
-            for (const pr of mergedPRs) {
-              console.log(`  #${pr.number}: ${pr.title}`);
-            }
+            const fs = require('fs');
+            fs.writeFileSync('/tmp/prs.json', JSON.stringify(mergedPRs, null, 2));
 
-            // 输出为 JSON 字符串
-            const prsJson = JSON.stringify(mergedPRs).replace(/"/g, '\\"');
-            core.setOutput('prs', prsJson);
+      - name: Upload Data Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-data
+          path: |
+            /tmp/commits.txt
+            /tmp/prs.json
+          retention-days: 1
 
-  # AI 分析阶段：决定版本号
-  analyze:
-    name: AI Analyze Release
+  generate-notes:
+    name: AI Generate Notes
     needs: prepare
-    if: needs.prepare.outputs.should_release == 'true'
     runs-on: ubuntu-latest
-    outputs:
-      bump: ${{ steps.ai.outputs.bump }}
-      new_version: ${{ steps.ai.outputs.new_version }}
-      release_notes: ${{ steps.ai.outputs.release_notes }}
-      reason: ${{ steps.ai.outputs.reason }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Download Data
+        uses: actions/download-artifact@v4
+        with:
+          name: release-data
+          path: /tmp
 
       - name: Setup Python
         uses: actions/setup-python@v5
@@ -192,138 +177,69 @@ jobs:
       - name: Install Dependencies
         run: pip install openai
 
-      - name: Download Analyze Script
-        run: |
-          if [ -f ".github/scripts/analyze_release.py" ]; then
-            echo "使用本地脚本"
-          else
-            echo "::error::找不到 analyze_release.py 脚本"
-            exit 1
-          fi
-
-      - name: Save PRs to File
-        run: |
-          echo "${{ needs.prepare.outputs.prs_since_last_release }}" > /tmp/prs.json
-
-      - name: Run AI Analysis
-        id: ai
+      - name: Generate Release Notes
+        id: gen
         env:
           DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
           DEEPSEEK_BASE_URL: ${{ secrets.DEEPSEEK_BASE_URL || 'https://api.deepseek.com' }}
           DEEPSEEK_MODEL: ${{ secrets.DEEPSEEK_MODEL || 'deepseek-chat' }}
         run: |
-          MOD_NAME="${{ needs.prepare.outputs.mod_name }}"
-          CURRENT_VERSION="${{ needs.prepare.outputs.current_version }}"
-          MANUAL_BUMP="${{ github.event.inputs.bump_type || 'auto' }}"
-
-          echo "分析 Mod: $MOD_NAME"
-          echo "当前版本: $CURRENT_VERSION"
-          echo "手动指定: $MANUAL_BUMP"
-
-          # 运行分析脚本
           python .github/scripts/analyze_release.py \
-            --mod-name "$MOD_NAME" \
+            --mod-name "${{ needs.prepare.outputs.mod_name }}" \
+            --tag "${{ needs.prepare.outputs.tag }}" \
+            --commits-file /tmp/commits.txt \
             --prs-file /tmp/prs.json \
-            --current-version "$CURRENT_VERSION" \
-            --manual-bump "$MANUAL_BUMP"
+            --output-file /tmp/notes.md
 
-      - name: Check Analysis Result
-        run: |
-          if [ "${{ steps.ai.outputs.bump }}" == "none" ]; then
-            echo "::warning::AI 判断无需升级版本号"
-            exit 0
-          fi
-          echo "AI 建议升级: ${{ steps.ai.outputs.bump }} -> ${{ steps.ai.outputs.new_version }}"
-          echo "原因: ${{ steps.ai.outputs.reason }}"
+      - name: Upload Notes Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-notes
+          path: /tmp/notes.md
+          retention-days: 1
 
-  # 创建 Release
-  create-release:
-    name: Create GitHub Release
-    needs: [prepare, analyze]
-    if: needs.prepare.outputs.should_release == 'true' && needs.analyze.outputs.bump != 'none'
+  release:
+    name: Create Release & Package
+    needs: [prepare, generate-notes]
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      release_id: ${{ steps.create_release.outputs.id }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Download Notes
+        uses: actions/download-artifact@v4
+        with:
+          name: release-notes
+          path: /tmp
+
       - name: Update About.xml Version
         run: |
-          NEW_VERSION="${{ needs.analyze.outputs.new_version }}"
-          # 去掉 v 前缀
-          VERSION_NUM="${NEW_VERSION#v}"
-
+          TAG="${{ needs.prepare.outputs.tag }}"
+          VER="${TAG#v}"
           if [ -f "About/About.xml" ]; then
-            # 更新 modVersion
-            sed -i "s|<modVersion>[^<]*</modVersion>|<modVersion>${VERSION_NUM}</modVersion>|g" About/About.xml
-            echo "已更新 About.xml 版本号为: $VERSION_NUM"
+            sed -i "s|<modVersion>[^<]*</modVersion>|<modVersion>${VER}</modVersion>|g" About/About.xml
+            echo "已更新 About.xml 版本号为: $VER"
           fi
 
       - name: Commit Version Update
+        if: github.event_name == 'workflow_dispatch'
         run: |
-          git config user.name "GitHub Actions"
-          git config user.email "actions@github.com"
-
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           if git diff --quiet; then
             echo "没有变更需要提交"
           else
             git add About/About.xml
-            git commit -m "chore: bump version to ${{ needs.analyze.outputs.new_version }}"
+            git commit -m "chore: release ${{ needs.prepare.outputs.tag }}"
             git push
           fi
 
-      - name: Create Release Notes File
+      - name: Package Mod
         run: |
-          NOTES="${{ needs.analyze.outputs.release_notes }}"
-          # 解码换行符
-          echo -e "$NOTES" > /tmp/release_notes.md
+          MOD="${{ needs.prepare.outputs.mod_name_safe }}"
+          TAG="${{ needs.prepare.outputs.tag }}"
+          mkdir -p "/tmp/${MOD}"
 
-          # 添加补充说明
-          if [ -n "${{ github.event.inputs.notes }}" ]; then
-            echo "" >> /tmp/release_notes.md
-            echo "---" >> /tmp/release_notes.md
-            echo "" >> /tmp/release_notes.md
-            echo "## 补充说明" >> /tmp/release_notes.md
-            echo "${{ github.event.inputs.notes }}" >> /tmp/release_notes.md
-          fi
-
-      - name: Create Tag
-        run: |
-          git tag "${{ needs.analyze.outputs.new_version }}"
-          git push origin "${{ needs.analyze.outputs.new_version }}"
-
-      - name: Create GitHub Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ needs.analyze.outputs.new_version }}
-          release_name: ${{ needs.prepare.outputs.mod_name }} ${{ needs.analyze.outputs.new_version }}
-          body_path: /tmp/release_notes.md
-          prerelease: ${{ github.event.inputs.prerelease || false }}
-
-  # 打包 Mod 文件
-  package:
-    name: Package Mod
-    needs: [prepare, analyze, create-release]
-    if: needs.analyze.outputs.bump != 'none'
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Package Mod Files
-        run: |
-          MOD_NAME="${{ needs.prepare.outputs.mod_name }}"
-          VERSION="${{ needs.analyze.outputs.new_version }}"
-
-          # 创建临时目录
-          mkdir -p /tmp/mod-package
-
-          # 复制文件 (排除开发文件)
           rsync -av --delete \
             --exclude='.git/' \
             --exclude='.github/' \
@@ -338,43 +254,55 @@ jobs:
             --exclude='.gitignore' \
             --exclude='.gitattributes' \
             --exclude='*.md' \
-            ./ /tmp/mod-package/
+            "./" "/tmp/${MOD}/"
 
-          # 打包
           cd /tmp
-          zip -r "${MOD_NAME}-${VERSION}.zip" mod-package/
+          zip -r "${MOD}-${TAG}.zip" "${MOD}/"
+          echo "打包完成: ${MOD}-${TAG}.zip"
 
-          echo "打包完成: ${MOD_NAME}-${VERSION}.zip"
+      - name: Prepare Final Notes
+        run: |
+          cp /tmp/notes.md /tmp/final_notes.md
+          if [ -n "${{ github.event.inputs.notes_extra }}" ]; then
+            echo "" >> /tmp/final_notes.md
+            echo "---" >> /tmp/final_notes.md
+            echo "" >> /tmp/final_notes.md
+            echo "## 补充说明" >> /tmp/final_notes.md
+            echo "${{ github.event.inputs.notes_extra }}" >> /tmp/final_notes.md
+          fi
 
-      - name: Upload Release Asset
-        uses: actions/upload-release-asset@v1
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.mod_name }} ${{ needs.prepare.outputs.tag }}
+          body_path: /tmp/final_notes.md
+          prerelease: ${{ needs.prepare.outputs.is_prerelease == 'true' }}
+          files: /tmp/${{ needs.prepare.outputs.mod_name_safe }}-${{ needs.prepare.outputs.tag }}.zip
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: /tmp/${{ needs.prepare.outputs.mod_name }}-${{ needs.analyze.outputs.new_version }}.zip
-          asset_name: ${{ needs.prepare.outputs.mod_name }}-${{ needs.analyze.outputs.new_version }}.zip
-          asset_content_type: application/zip
 
-  # 触发 Steam 上传
-  trigger-steam-upload:
-    name: Trigger Steam Upload
-    needs: [prepare, analyze, create-release]
-    if: needs.analyze.outputs.bump != 'none' && !github.event.inputs.prerelease
-    runs-on: ubuntu-latest
-    steps:
-      - name: Trigger Steam Upload Workflow
+      - name: Trigger Steam Upload
+        if: ${{ needs.prepare.outputs.is_prerelease != 'true' }}
         uses: actions/github-script@v7
         with:
           script: |
-            await github.rest.actions.createWorkflowDispatch({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              workflow_id: 'steam-upload.yml',
-              ref: 'main',
-              inputs: {
-                release_tag: '${{ needs.analyze.outputs.new_version }}',
-                release_id: '${{ needs.create-release.outputs.release_id }}'
+            try {
+              await github.rest.actions.createWorkflowDispatch({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                workflow_id: 'steam-upload.yml',
+                ref: 'main',
+                inputs: {
+                  release_tag: '${{ needs.prepare.outputs.tag }}'
+                }
+              });
+              console.log('Steam 上传工作流已触发');
+            } catch (e) {
+              if (e.status === 404) {
+                console.log('未找到 steam-upload.yml，跳过 Steam 触发');
+              } else {
+                throw e;
               }
-            });
-            console.log('已触发 Steam 上传工作流');
+            }
