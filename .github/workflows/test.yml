@@ -16,5 +16,5 @@ on:
 
 jobs:
   test:
-    uses: RimWorld-RimMind-Mod/Workflows/.github/workflows/test.yml@v1
+    uses: RimWorld-RimMind-Mod/Workflows/.github/workflows/test.yml@main
     secrets: inherit

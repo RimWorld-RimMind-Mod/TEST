@@ -13,7 +13,7 @@ permissions:
 
 jobs:
   release:
-    uses: RimWorld-RimMind-Mod/Workflows/.github/workflows/release.yml@v1
+    uses: RimWorld-RimMind-Mod/Workflows/.github/workflows/release.yml@main
     with:
       tag-name: ${{ github.ref_name }}
     secrets: inherit
