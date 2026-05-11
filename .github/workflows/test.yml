@@ -17,4 +17,6 @@ on:
 jobs:
   test:
     uses: RimWorld-RimMind-Mod/Workflows/.github/workflows/test.yml@main
+    with:
+      dotnet-version: '8.0.x'
     secrets: inherit
